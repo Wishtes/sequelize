@@ -452,4 +452,158 @@ describe('AsyncLocalStorage (ContinuationLocalStorage) Transactions (CLS)', () =
       });
     });
   });
+
+  describe('nested async operations', () => {
+    beforeEach(async () => {
+      await vars.User.truncate();
+    });
+
+    it('propagates transaction context through Promise.all', async () => {
+      await vars.clsSequelize.transaction(async () => {
+        await vars.User.create({ name: 'bob' });
+
+        const results = await Promise.all([
+          vars.User.findAll({}),
+          vars.User.count({}),
+        ]);
+
+        expect(results[0]).to.have.length(1);
+        expect(results[1]).to.equal(1);
+      });
+
+      const users = await vars.User.findAll();
+      expect(users).to.have.length(1);
+    });
+
+    it('propagates transaction context through setTimeout', async () => {
+      await vars.clsSequelize.transaction(async () => {
+        await vars.User.create({ name: 'bob' });
+
+        await new Promise<void>(resolve => {
+          setTimeout(async () => {
+            const users = await vars.User.findAll({});
+            expect(users).to.have.length(1);
+            resolve();
+          }, 10);
+        });
+      });
+
+      const users = await vars.User.findAll();
+      expect(users).to.have.length(1);
+    });
+
+    it('propagates transaction context through nested async chains', async () => {
+      await vars.clsSequelize.transaction(async () => {
+        await vars.User.create({ name: 'bob' });
+
+        const verifyTransaction = async () => {
+          const users = await vars.User.findAll({});
+          expect(users).to.have.length(1);
+        };
+
+        await delay(10);
+        await verifyTransaction();
+        await delay(10);
+        await verifyTransaction();
+      });
+
+      const users = await vars.User.findAll();
+      expect(users).to.have.length(1);
+    });
+  });
+
+  describe('manual transaction parameter priority', () => {
+    beforeEach(async () => {
+      await vars.User.truncate();
+    });
+
+    it('manual transaction parameter takes priority over CLS', async () => {
+      await vars.clsSequelize.transaction(async () => {
+        await vars.User.create({ name: 'bob' });
+
+        const anotherTransaction = await vars.clsSequelize.startUnmanagedTransaction();
+        try {
+          const users = await vars.User.findAll({ transaction: anotherTransaction });
+          expect(users).to.have.length(0);
+        } finally {
+          await anotherTransaction.rollback();
+        }
+      });
+    });
+
+    it('explicit null transaction bypasses CLS context', async () => {
+      await vars.clsSequelize.transaction(async () => {
+        await vars.User.create({ name: 'bob' });
+
+        const users = await vars.User.findAll({ transaction: null });
+        expect(users).to.have.length(0);
+      });
+    });
+  });
+
+  describe('nested transaction context propagation', () => {
+    beforeEach(async () => {
+      await vars.User.truncate();
+    });
+
+    it('propagates context from outer transaction to inner operations', async () => {
+      await vars.clsSequelize.transaction(async () => {
+        await vars.User.create({ name: 'outer' });
+
+        await vars.clsSequelize.transaction(async () => {
+          await vars.User.create({ name: 'inner' });
+
+          const users = await vars.User.findAll({});
+          expect(users).to.have.length(2);
+        });
+
+        const users = await vars.User.findAll({});
+        expect(users).to.have.length(2);
+      });
+
+      const users = await vars.User.findAll();
+      expect(users).to.have.length(2);
+    });
+  });
+
+  describe('auto-commit mode when no transaction is active', () => {
+    beforeEach(async () => {
+      await vars.User.truncate();
+    });
+
+    it('executes queries in auto-commit mode outside transaction', async () => {
+      await vars.User.create({ name: 'bob' });
+
+      const users = await vars.User.findAll();
+      expect(users).to.have.length(1);
+    });
+  });
+
+  describe('CLS with aggregate and increment', () => {
+    beforeEach(async () => {
+      await vars.User.truncate();
+    });
+
+    it('automatically uses transaction in aggregate', async () => {
+      await vars.clsSequelize.transaction(async () => {
+        await vars.User.create({ name: 'bob' });
+
+        const count = await vars.User.aggregate('name', 'count');
+        expect(count).to.equal(1);
+      });
+    });
+
+    it('automatically uses transaction in static increment', async () => {
+      await vars.clsSequelize.transaction(async () => {
+        await vars.User.create({ name: 'bob' });
+        await vars.User.increment('id', { where: { name: 'bob' } });
+
+        const users = await vars.User.findAll({ where: { name: 'bob' } });
+        expect(users).to.have.length(1);
+      });
+
+      const users = await vars.User.findAll({ where: { name: 'bob' } });
+      expect(users).to.have.length(1);
+    });
+  });
 });

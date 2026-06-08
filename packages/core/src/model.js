@@ -1606,6 +1606,8 @@ ${associationOwner._getAssociationDebugList()}`);
     options = cloneDeep(options) ?? {};
     options.model = this;
 
+    setTransactionFromCls(options, this.sequelize);
+
     // We need to preserve attributes here as the `injectScope` call would inject non aggregate columns.
     const prevAttributes = options.attributes;
     this._injectScope(options);
@@ -3288,6 +3290,8 @@ Instead of specifying a Model, either:
         return rawFields;
       }, {});
     }
+
+    setTransactionFromCls(options, this.sequelize);
 
     this._injectScope(options);
     this._optionsMustContainWhere(options);

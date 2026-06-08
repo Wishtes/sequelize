@@ -362,10 +362,10 @@ Use Sequelize#query if you wish to use replacements.`);
       }
     };
 
-    setTransactionFromCls(options, this);
     const retryOptions = { ...this.options.retry, ...options.retry };
 
     return await retry(async () => {
+      setTransactionFromCls(options, this);
       checkTransaction();
 
       const connection = options.transaction

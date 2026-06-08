@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { StrictRequiredBy } from '@sequelize/utils';
 import { EMPTY_OBJECT } from '@sequelize/utils';
 import assert from 'node:assert';
@@ -70,15 +71,28 @@ export class Transaction {
   }
 
   getConnection(): AbstractConnection {
-    if (!this.#connection) {
-      throw new Error('This transaction is not bound to a connection.');
+    const existingConnection = this.#connection;
+    if (existingConnection) {
+      return existingConnection;
     }
 
-    return this.#connection;
+    if (this.parent) {
+      return this.parent.getConnection();
+    }
+
+    throw new Error('This transaction is not bound to a connection.');
   }
 
   getConnectionIfExists(): AbstractConnection | undefined {
-    return this.#connection;
+    if (this.#connection) {
+      return this.#connection;
+    }
+
+    return this.parent?.getConnectionIfExists();
+  }
+
+  hasConnection(): boolean {
+    return this.#connection != null || (this.parent?.hasConnection() ?? false);
   }
 
   /**
