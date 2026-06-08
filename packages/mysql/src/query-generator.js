@@ -287,4 +287,48 @@ export class MySqlQueryGenerator extends MySqlQueryGeneratorTypeScript {
 
     return fragment;
   }
+
+  jsonTable(piece, escapeOptions) {
+    const databaseVersion = this.sequelize.getDatabaseVersionIfExist();
+    if (databaseVersion) {
+      const semver = require('semver');
+      const version = semver.coerce(databaseVersion);
+      if (version && semver.lt(version, '8.0.4')) {
+        throw new Error('JSON_TABLE is not supported in MySQL < 8.0.4');
+      }
+    }
+
+    const formatColumn = (col) => {
+      if (col.nested) {
+        const nestedCols = col.nested.columns.map(formatColumn).join(', ');
+        return `NESTED PATH ${this.escape(col.nested.path)} COLUMNS (${nestedCols})`;
+      }
+      if (col.forOrdinality) {
+        return `${this.quoteIdentifier(col.name)} FOR ORDINALITY`;
+      }
+      
+      let colSql = `${this.quoteIdentifier(col.name)} ${col.type}`;
+      if (col.path) {
+        colSql += ` PATH ${this.escape(col.path)}`;
+      }
+      if (col.onEmpty !== undefined) {
+        colSql += ` DEFAULT ${this.escape(col.onEmpty, escapeOptions)} ON EMPTY`;
+      } else if (col.errorOnEmpty) {
+        colSql += ` ERROR ON EMPTY`;
+      }
+      if (col.onError !== undefined) {
+        colSql += ` DEFAULT ${this.escape(col.onError, escapeOptions)} ON ERROR`;
+      } else if (col.errorOnError) {
+        colSql += ` ERROR ON ERROR`;
+      }
+      return colSql;
+    };
+
+    const expr = this.escape(piece.options.expression, escapeOptions);
+    const path = this.escape(piece.options.path); // path is a string literal
+    const columns = piece.options.columns.map(formatColumn).join(', ');
+    const alias = piece.options.alias ? ` AS ${this.quoteIdentifier(piece.options.alias)}` : '';
+
+    return `JSON_TABLE(${expr}, ${path} COLUMNS (${columns}))${alias}`;
+  }
 }

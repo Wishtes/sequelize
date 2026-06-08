@@ -226,10 +226,11 @@ export type DialectSupports = {
   jsonOperations: boolean;
   /** Whether this dialect supports returning quoted & unquoted JSON strings  */
   jsonExtraction: {
-    unquoted: boolean;
-    quoted: boolean;
-  };
-  tmpTableTrigger: boolean;
+      unquoted: boolean;
+      quoted: boolean;
+    };
+    jsonTable: boolean;
+    tmpTableTrigger: boolean;
   indexHints: boolean;
   tableHints: boolean;
   searchPath: boolean;

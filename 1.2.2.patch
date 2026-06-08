@@ -1,0 +1,118 @@
+diff --git a/packages/core/src/abstract-dialect/dialect.ts b/packages/core/src/abstract-dialect/dialect.ts
+index f07bff2f5..581d0db8d 100644
+--- a/packages/core/src/abstract-dialect/dialect.ts
++++ b/packages/core/src/abstract-dialect/dialect.ts
+@@ -226,10 +226,11 @@ export type DialectSupports = {
+   jsonOperations: boolean;
+   /** Whether this dialect supports returning quoted & unquoted JSON strings  */
+   jsonExtraction: {
+-    unquoted: boolean;
+-    quoted: boolean;
+-  };
+-  tmpTableTrigger: boolean;
++      unquoted: boolean;
++      quoted: boolean;
++    };
++    jsonTable: boolean;
++    tmpTableTrigger: boolean;
+   indexHints: boolean;
+   tableHints: boolean;
+   searchPath: boolean;
+diff --git a/packages/core/src/expression-builders/sql.ts b/packages/core/src/expression-builders/sql.ts
+index fb87432c6..c82295716 100644
+--- a/packages/core/src/expression-builders/sql.ts
++++ b/packages/core/src/expression-builders/sql.ts
+@@ -7,6 +7,7 @@ import { Unquote } from './dialect-aware-fn.js';
+ import { fn } from './fn.js';
+ import { identifier } from './identifier.js';
+ import { jsonPath } from './json-path.js';
++import { jsonTable } from './json-table.js';
+ import { list } from './list.js';
+ import { Literal, literal } from './literal.js';
+ import { Random } from './random.js';
+@@ -68,6 +69,7 @@ sql.col = col;
+ sql.fn = fn;
+ sql.identifier = identifier;
+ sql.jsonPath = jsonPath;
++sql.jsonTable = jsonTable;
+ sql.list = list;
+ sql.literal = literal;
+ sql.where = where;
+diff --git a/packages/mysql/src/dialect.ts b/packages/mysql/src/dialect.ts
+index 6bdbe79c6..9de1eb1e6 100644
+--- a/packages/mysql/src/dialect.ts
++++ b/packages/mysql/src/dialect.ts
+@@ -83,6 +83,7 @@ export class MySqlDialect extends AbstractDialect<MySqlDialectOptions, MySqlConn
+       JSON: true,
+     },
+     jsonOperations: true,
++    jsonTable: true,
+     jsonExtraction: {
+       unquoted: true,
+       quoted: true,
+diff --git a/packages/mysql/src/query-generator.d.ts b/packages/mysql/src/query-generator.d.ts
+index 454da5787..70b6463ae 100644
+--- a/packages/mysql/src/query-generator.d.ts
++++ b/packages/mysql/src/query-generator.d.ts
+@@ -1,3 +1,7 @@
++import type { EscapeOptions } from '@sequelize/core/_non-semver-use-at-your-own-risk_/abstract-dialect/query-generator-typescript.js';
++import type { JsonTable } from '@sequelize/core/_non-semver-use-at-your-own-risk_/expression-builders/json-table.js';
+ import { MySqlQueryGeneratorTypeScript } from './query-generator-typescript.internal.js';
+ 
+-export class MySqlQueryGenerator extends MySqlQueryGeneratorTypeScript {}
++export class MySqlQueryGenerator extends MySqlQueryGeneratorTypeScript {
++  jsonTable(piece: JsonTable, escapeOptions?: EscapeOptions): string;
++}
+diff --git a/packages/mysql/src/query-generator.js b/packages/mysql/src/query-generator.js
+index a5a5653b8..f75d9eec7 100644
+--- a/packages/mysql/src/query-generator.js
++++ b/packages/mysql/src/query-generator.js
+@@ -287,4 +287,48 @@ export class MySqlQueryGenerator extends MySqlQueryGeneratorTypeScript {
+ 
+     return fragment;
+   }
++
++  jsonTable(piece, escapeOptions) {
++    const databaseVersion = this.sequelize.getDatabaseVersionIfExist();
++    if (databaseVersion) {
++      const semver = require('semver');
++      const version = semver.coerce(databaseVersion);
++      if (version && semver.lt(version, '8.0.4')) {
++        throw new Error('JSON_TABLE is not supported in MySQL < 8.0.4');
++      }
++    }
++
++    const formatColumn = (col) => {
++      if (col.nested) {
++        const nestedCols = col.nested.columns.map(formatColumn).join(', ');
++        return `NESTED PATH ${this.escape(col.nested.path)} COLUMNS (${nestedCols})`;
++      }
++      if (col.forOrdinality) {
++        return `${this.quoteIdentifier(col.name)} FOR ORDINALITY`;
++      }
++      
++      let colSql = `${this.quoteIdentifier(col.name)} ${col.type}`;
++      if (col.path) {
++        colSql += ` PATH ${this.escape(col.path)}`;
++      }
++      if (col.onEmpty !== undefined) {
++        colSql += ` DEFAULT ${this.escape(col.onEmpty, escapeOptions)} ON EMPTY`;
++      } else if (col.errorOnEmpty) {
++        colSql += ` ERROR ON EMPTY`;
++      }
++      if (col.onError !== undefined) {
++        colSql += ` DEFAULT ${this.escape(col.onError, escapeOptions)} ON ERROR`;
++      } else if (col.errorOnError) {
++        colSql += ` ERROR ON ERROR`;
++      }
++      return colSql;
++    };
++
++    const expr = this.escape(piece.options.expression, escapeOptions);
++    const path = this.escape(piece.options.path); // path is a string literal
++    const columns = piece.options.columns.map(formatColumn).join(', ');
++    const alias = piece.options.alias ? ` AS ${this.quoteIdentifier(piece.options.alias)}` : '';
++
++    return `JSON_TABLE(${expr}, ${path} COLUMNS (${columns}))${alias}`;
++  }
+ }
