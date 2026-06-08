@@ -826,6 +826,18 @@ export class AbstractQueryGeneratorTypeScript<Dialect extends AbstractDialect = 
     throw new Error(`jsonPathExtractionQuery has not been implemented in ${this.dialect.name}.`);
   }
 
+  jsonTableQuery(
+    _jsonExpression: Expression,
+    _rootPath: string,
+    _columns: ReadonlyArray<{ name: string; type: string; path: string; onError?: string; onEmpty?: string }>,
+  ): string {
+    if (!this.dialect.supports.jsonTable) {
+      throw new Error(`JSON_TABLE is not supported in ${this.dialect.name}.`);
+    }
+
+    throw new Error(`jsonTableQuery has not been implemented in ${this.dialect.name}.`);
+  }
+
   /**
    * Escapes a value (e.g. a string, number or date) as an SQL value (as opposed to an identifier).
    *

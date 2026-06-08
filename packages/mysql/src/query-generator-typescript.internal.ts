@@ -172,6 +172,29 @@ export class MySqlQueryGeneratorTypeScript extends AbstractQueryGenerator {
     return `json_unquote(${this.escape(arg, options)})`;
   }
 
+  jsonTableQuery(
+    jsonExpression: Expression,
+    rootPath: string,
+    columns: ReadonlyArray<{ name: string; type: string; path: string; onError?: string; onEmpty?: string }>,
+  ): string {
+    const escapedJsonExpr = this.escape(jsonExpression);
+    const escapedPath = this.escape(rootPath);
+    const columnDefs = columns.map(col => {
+      let def = `${this.quoteIdentifier(col.name)} ${col.type} PATH ${this.escape(col.path)}`;
+      if (col.onError) {
+        def += ` ON ERROR ${col.onError}`;
+      }
+
+      if (col.onEmpty) {
+        def += ` ON EMPTY ${col.onEmpty}`;
+      }
+
+      return def;
+    }).join(',\n');
+
+    return `JSON_TABLE(${escapedJsonExpr}, ${escapedPath} COLUMNS (\n${columnDefs}\n))`;
+  }
+
   versionQuery() {
     return 'SELECT VERSION() as `version`';
   }

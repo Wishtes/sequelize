@@ -229,6 +229,8 @@ export type DialectSupports = {
     unquoted: boolean;
     quoted: boolean;
   };
+  /** Whether this dialect supports the JSON_TABLE function (MySQL 8.0.4+) */
+  jsonTable?: boolean;
   tmpTableTrigger: boolean;
   indexHints: boolean;
   tableHints: boolean;
