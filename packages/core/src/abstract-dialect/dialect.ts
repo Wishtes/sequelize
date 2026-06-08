@@ -229,6 +229,8 @@ export type DialectSupports = {
     unquoted: boolean;
     quoted: boolean;
   };
+  /** Whether this dialect supports JSON_TABLE function */
+  jsonTable: boolean;
   tmpTableTrigger: boolean;
   indexHints: boolean;
   tableHints: boolean;
@@ -476,6 +478,7 @@ export abstract class AbstractDialect<
       unquoted: false,
       quoted: false,
     },
+    jsonTable: false,
     REGEXP: false,
     IREGEXP: false,
     tmpTableTrigger: false,

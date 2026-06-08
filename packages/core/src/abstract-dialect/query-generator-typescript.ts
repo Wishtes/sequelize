@@ -16,6 +16,7 @@ import { DialectAwareFn } from '../expression-builders/dialect-aware-fn.js';
 import { Fn } from '../expression-builders/fn.js';
 import { Identifier } from '../expression-builders/identifier.js';
 import { JsonPath } from '../expression-builders/json-path.js';
+import { JsonTable } from '../expression-builders/json-table.js';
 import { List } from '../expression-builders/list.js';
 import { Literal } from '../expression-builders/literal.js';
 import { Value } from '../expression-builders/value.js';
@@ -792,6 +793,10 @@ export class AbstractQueryGeneratorTypeScript<Dialect extends AbstractDialect = 
       return this.#internals.formatDialectAwareFn(piece, options);
     }
 
+    if (piece instanceof JsonTable) {
+      return this.jsonTableQuery(this.escape(piece.jsonExpression, options), piece.columns as any, piece.options);
+    }
+
     throw new Error(`Unknown sequelize method ${piece.constructor.name}`);
   }
 
@@ -923,6 +928,23 @@ export class AbstractQueryGeneratorTypeScript<Dialect extends AbstractDialect = 
     }
 
     throw new Error(`getRandomFloatFunctionCall has not been implemented in ${this.dialect.name}.`);
+  }
+
+  jsonTableQuery(
+    _jsonExpression: string,
+    _columns: Array<{
+      name: string;
+      type: string;
+      path?: string;
+      existsOnEmpty?: boolean;
+    }>,
+    _options?: { alias?: string; path?: string },
+  ): string {
+    if (!this.dialect.supports.jsonTable) {
+      throw new Error(`JSON_TABLE is not supported by ${this.dialect.name} dialect.`);
+    }
+
+    throw new Error(`jsonTableQuery has not been implemented in ${this.dialect.name}.`);
   }
 
   getToggleForeignKeyChecksQuery(_enable: boolean): string {

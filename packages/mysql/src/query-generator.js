@@ -287,4 +287,20 @@ export class MySqlQueryGenerator extends MySqlQueryGeneratorTypeScript {
 
     return fragment;
   }
+
+  jsonTableQuery(jsonExpression, columns, options = {}) {
+    const { alias = 'jt', path = '$' } = options;
+
+    const columnDefinitions = columns
+      .map(col => {
+        const name = this.quoteIdentifier(col.name);
+        const type = col.type.toUpperCase();
+        const pathSpec = col.path ? ` PATH '${col.path}'` : '';
+        const existsOnEmpty = col.existsOnEmpty ? ' EXISTS ON EMPTY' : '';
+        return `${name} ${type}${pathSpec}${existsOnEmpty}`;
+      })
+      .join(', ');
+
+    return `JSON_TABLE(${this.escape(jsonExpression)}, '${path}' COLUMNS(${columnDefinitions})) AS ${this.quoteIdentifier(alias)}`;
+  }
 }
