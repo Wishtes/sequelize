@@ -452,4 +452,148 @@ describe('AsyncLocalStorage (ContinuationLocalStorage) Transactions (CLS)', () =
       });
     });
   });
+
+  describe('nested async context propagation', () => {
+    it('propagates transaction context through Promise.all', async () => {
+      await vars.clsSequelize.transaction(async t => {
+        await vars.User.create({ name: 'alice' });
+
+        const [count, rows] = await Promise.all([
+          vars.User.count(),
+          vars.User.findAll(),
+        ]);
+
+        expect(count).to.equal(1);
+        expect(rows).to.have.length(1);
+        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t);
+      });
+    });
+
+    it('propagates transaction context through setTimeout', async () => {
+      await vars.clsSequelize.transaction(async t => {
+        await vars.User.create({ name: 'bob' });
+
+        const result = await new Promise<string>(resolve => {
+          setTimeout(async () => {
+            const clsTransaction = vars.clsSequelize.getCurrentClsTransaction();
+            if (clsTransaction) {
+              const users = await vars.User.findAll();
+              resolve(`found:${users.length},tx:${clsTransaction.id}`);
+            } else {
+              resolve('no-tx');
+            }
+          }, 10);
+        });
+
+        expect(result).to.include('found:1');
+        expect(result).to.include(`tx:${t.id}`);
+      });
+    });
+
+    it('manual transaction parameter takes priority over CLS context', async () => {
+      const manualTx = await vars.clsSequelize.startUnmanagedTransaction();
+
+      try {
+        await vars.clsSequelize.transaction(async autoTx => {
+          await vars.User.create({ name: 'in-auto-tx' }, { transaction: manualTx });
+          await vars.User.create({ name: 'in-auto-tx-cls' });
+
+          const manualResults = await vars.User.findAll({ transaction: manualTx });
+          const clsResults = await vars.User.findAll({});
+
+          expect(manualResults).to.have.length(1);
+          expect(manualResults[0].name).to.equal('in-auto-tx');
+          expect(clsResults).to.have.length(1);
+          expect(clsResults[0].name).to.equal('in-auto-tx-cls');
+        });
+
+        await manualTx.rollback();
+      } catch (err) {
+        await manualTx.rollback();
+        throw err;
+      }
+    });
+
+    it('nested transaction context propagates correctly', async () => {
+      await vars.clsSequelize.transaction(async t1 => {
+        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t1);
+
+        await vars.clsSequelize.transaction({ nestMode: 'savepoint' }, async t2 => {
+          expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t2);
+
+          await vars.User.create({ name: 'nested' });
+
+          const users = await vars.User.findAll();
+          expect(users).to.have.length(1);
+        });
+
+        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t1);
+      });
+    });
+
+    it('queries run in autocommit mode when no transaction is active', async () => {
+      expect(vars.clsSequelize.getCurrentClsTransaction()).to.be.undefined;
+
+      await vars.User.create({ name: 'no-tx' });
+
+      const users = await vars.User.findAll();
+      expect(users).to.have.length(1);
+      expect(users[0].name).to.equal('no-tx');
+    });
+
+    it('transaction context is preserved across multiple Promise.all queries', async () => {
+      await vars.clsSequelize.transaction(async t => {
+        await Promise.all([
+          vars.User.create({ name: 'user1' }),
+          vars.User.create({ name: 'user2' }),
+          vars.User.create({ name: 'user3' }),
+        ]);
+
+        const [count, users, one] = await Promise.all([
+          vars.User.count(),
+          vars.User.findAll(),
+          vars.User.findOne({ where: { name: 'user2' } }),
+        ]);
+
+        expect(count).to.equal(3);
+        expect(users).to.have.length(3);
+        expect(one).to.be.ok;
+        expect(one!.name).to.equal('user2');
+        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t);
+      });
+    });
+
+    it('findAndCountAll propagates transaction in Promise.all', async () => {
+      await vars.clsSequelize.transaction(async t => {
+        await vars.User.create({ name: 'fac' });
+
+        const result = await vars.User.findAndCountAll({});
+
+        expect(result.count).to.equal(1);
+        expect(result.rows).to.have.length(1);
+        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t);
+      });
+    });
+
+    it('runInClsContext binds unmanaged transaction to CLS', async () => {
+      const tx = await vars.clsSequelize.startUnmanagedTransaction();
+
+      try {
+        expect(vars.clsSequelize.getCurrentClsTransaction()).to.be.undefined;
+
+        await tx.runInClsContext(async () => {
+          expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(tx);
+
+          await vars.User.create({ name: 'via-runInClsContext' });
+
+          const users = await vars.User.findAll();
+          expect(users).to.have.length(1);
+        });
+
+        expect(vars.clsSequelize.getCurrentClsTransaction()).to.be.undefined;
+      } finally {
+        await tx.rollback();
+      }
+    });
+  });
 });

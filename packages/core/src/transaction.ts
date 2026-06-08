@@ -1,6 +1,7 @@
 import type { StrictRequiredBy } from '@sequelize/utils';
 import { EMPTY_OBJECT } from '@sequelize/utils';
 import assert from 'node:assert';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Class } from 'type-fest';
 import type { AbstractConnection, ConstraintChecking, Logging, Sequelize } from './index.js';
 
@@ -439,6 +440,18 @@ export class Transaction {
     }
 
     return this;
+  }
+
+  static #globalCls = new AsyncLocalStorage<Transaction>();
+
+  static get globalCls(): AsyncLocalStorage<Transaction> {
+    return Transaction.#globalCls;
+  }
+
+  async runInClsContext<T>(callback: () => Promise<T> | T): Promise<T> {
+    return this.sequelize.transaction({ transaction: this }, async () => {
+      return callback();
+    });
   }
 }
 

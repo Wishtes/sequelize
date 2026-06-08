@@ -1606,6 +1606,8 @@ ${associationOwner._getAssociationDebugList()}`);
     options = cloneDeep(options) ?? {};
     options.model = this;
 
+    setTransactionFromCls(options, this.sequelize);
+
     // We need to preserve attributes here as the `injectScope` call would inject non aggregate columns.
     const prevAttributes = options.attributes;
     this._injectScope(options);
@@ -1773,7 +1775,10 @@ ${associationOwner._getAssociationDebugList()}`);
       );
     }
 
-    const countOptions = cloneDeep(options) ?? {};
+    options = cloneDeep(options) ?? {};
+    setTransactionFromCls(options, this.sequelize);
+
+    const countOptions = { ...options };
 
     if (countOptions.attributes && !options.countGroupedRows) {
       countOptions.attributes = undefined;
@@ -1916,6 +1921,9 @@ ${associationOwner._getAssociationDebugList()}`);
           'Please note that the API has changed, and is now options only (an object with where, defaults keys, transaction etc.)',
       );
     }
+
+    options = { ...options };
+    setTransactionFromCls(options, this.sequelize);
 
     let values;
 
@@ -2085,6 +2093,9 @@ ${associationOwner._getAssociationDebugList()}`);
     if (!options || !options.where) {
       throw new Error('Missing where attribute in the options parameter passed to findCreateFind.');
     }
+
+    options = { ...options };
+    setTransactionFromCls(options, this.sequelize);
 
     let values = { ...options.defaults };
     if (isPlainObject(options.where)) {
@@ -3264,6 +3275,8 @@ Instead of specifying a Model, either:
       fields = [fields];
     }
 
+    setTransactionFromCls(options, this.sequelize);
+
     const modelDefinition = this.modelDefinition;
     const attributeDefs = modelDefinition.attributes;
 
@@ -4236,6 +4249,8 @@ Instead of specifying a Model, either:
       include: this._options.include || undefined,
     });
 
+    setTransactionFromCls(options, this.sequelize);
+
     const reloaded = await this.constructor.findOne(options);
     if (!reloaded) {
       throw new SequelizeErrors.InstanceError(
@@ -4292,6 +4307,7 @@ Instead of specifying a Model, either:
     }
 
     options = cloneDeep(options);
+    setTransactionFromCls(options, this.sequelize);
     const setOptions = cloneDeep(options);
     setOptions.attributes = options.fields;
     this.set(values, setOptions);
@@ -4464,6 +4480,8 @@ Instead of specifying a Model, either:
     options = cloneDeep(options) ?? {};
     options.where = { ...options.where, ...identifier };
     options.instance = this;
+
+    setTransactionFromCls(options, this.sequelize);
 
     await this.constructor.increment(fields, options);
 

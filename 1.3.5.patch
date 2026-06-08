@@ -1,0 +1,276 @@
+diff --git a/packages/core/src/model.js b/packages/core/src/model.js
+index 6a2f98ada..6338c90d0 100644
+--- a/packages/core/src/model.js
++++ b/packages/core/src/model.js
+@@ -1606,6 +1606,8 @@ ${associationOwner._getAssociationDebugList()}`);
+     options = cloneDeep(options) ?? {};
+     options.model = this;
+ 
++    setTransactionFromCls(options, this.sequelize);
++
+     // We need to preserve attributes here as the `injectScope` call would inject non aggregate columns.
+     const prevAttributes = options.attributes;
+     this._injectScope(options);
+@@ -1773,7 +1775,10 @@ ${associationOwner._getAssociationDebugList()}`);
+       );
+     }
+ 
+-    const countOptions = cloneDeep(options) ?? {};
++    options = cloneDeep(options) ?? {};
++    setTransactionFromCls(options, this.sequelize);
++
++    const countOptions = { ...options };
+ 
+     if (countOptions.attributes && !options.countGroupedRows) {
+       countOptions.attributes = undefined;
+@@ -1917,6 +1922,9 @@ ${associationOwner._getAssociationDebugList()}`);
+       );
+     }
+ 
++    options = { ...options };
++    setTransactionFromCls(options, this.sequelize);
++
+     let values;
+ 
+     let instance = await this.findOne(options);
+@@ -2086,6 +2094,9 @@ ${associationOwner._getAssociationDebugList()}`);
+       throw new Error('Missing where attribute in the options parameter passed to findCreateFind.');
+     }
+ 
++    options = { ...options };
++    setTransactionFromCls(options, this.sequelize);
++
+     let values = { ...options.defaults };
+     if (isPlainObject(options.where)) {
+       values = defaults(values, options.where);
+@@ -3264,6 +3275,8 @@ Instead of specifying a Model, either:
+       fields = [fields];
+     }
+ 
++    setTransactionFromCls(options, this.sequelize);
++
+     const modelDefinition = this.modelDefinition;
+     const attributeDefs = modelDefinition.attributes;
+ 
+@@ -4236,6 +4249,8 @@ Instead of specifying a Model, either:
+       include: this._options.include || undefined,
+     });
+ 
++    setTransactionFromCls(options, this.sequelize);
++
+     const reloaded = await this.constructor.findOne(options);
+     if (!reloaded) {
+       throw new SequelizeErrors.InstanceError(
+@@ -4292,6 +4307,7 @@ Instead of specifying a Model, either:
+     }
+ 
+     options = cloneDeep(options);
++    setTransactionFromCls(options, this.sequelize);
+     const setOptions = cloneDeep(options);
+     setOptions.attributes = options.fields;
+     this.set(values, setOptions);
+@@ -4465,6 +4481,8 @@ Instead of specifying a Model, either:
+     options.where = { ...options.where, ...identifier };
+     options.instance = this;
+ 
++    setTransactionFromCls(options, this.sequelize);
++
+     await this.constructor.increment(fields, options);
+ 
+     return this;
+diff --git a/packages/core/src/sequelize.js b/packages/core/src/sequelize.js
+index 763ad7383..845e1e796 100644
+--- a/packages/core/src/sequelize.js
++++ b/packages/core/src/sequelize.js
+@@ -366,6 +366,7 @@ Use Sequelize#query if you wish to use replacements.`);
+     const retryOptions = { ...this.options.retry, ...options.retry };
+ 
+     return await retry(async () => {
++      setTransactionFromCls(options, this);
+       checkTransaction();
+ 
+       const connection = options.transaction
+diff --git a/packages/core/src/transaction.ts b/packages/core/src/transaction.ts
+index 1ea26dfa8..6fb1467a8 100644
+--- a/packages/core/src/transaction.ts
++++ b/packages/core/src/transaction.ts
+@@ -1,6 +1,7 @@
+ import type { StrictRequiredBy } from '@sequelize/utils';
+ import { EMPTY_OBJECT } from '@sequelize/utils';
+ import assert from 'node:assert';
++import { AsyncLocalStorage } from 'node:async_hooks';
+ import type { Class } from 'type-fest';
+ import type { AbstractConnection, ConstraintChecking, Logging, Sequelize } from './index.js';
+ 
+@@ -440,6 +441,18 @@ export class Transaction {
+ 
+     return this;
+   }
++
++  static #globalCls = new AsyncLocalStorage<Transaction>();
++
++  static get globalCls(): AsyncLocalStorage<Transaction> {
++    return Transaction.#globalCls;
++  }
++
++  async runInClsContext<T>(callback: () => Promise<T> | T): Promise<T> {
++    return this.sequelize.transaction({ transaction: this }, async () => {
++      return callback();
++    });
++  }
+ }
+ 
+ /**
+diff --git a/packages/core/test/integration/cls.test.ts b/packages/core/test/integration/cls.test.ts
+index 161c73420..2877fb75c 100644
+--- a/packages/core/test/integration/cls.test.ts
++++ b/packages/core/test/integration/cls.test.ts
+@@ -452,4 +452,148 @@ describe('AsyncLocalStorage (ContinuationLocalStorage) Transactions (CLS)', () =
+       });
+     });
+   });
++
++  describe('nested async context propagation', () => {
++    it('propagates transaction context through Promise.all', async () => {
++      await vars.clsSequelize.transaction(async t => {
++        await vars.User.create({ name: 'alice' });
++
++        const [count, rows] = await Promise.all([
++          vars.User.count(),
++          vars.User.findAll(),
++        ]);
++
++        expect(count).to.equal(1);
++        expect(rows).to.have.length(1);
++        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t);
++      });
++    });
++
++    it('propagates transaction context through setTimeout', async () => {
++      await vars.clsSequelize.transaction(async t => {
++        await vars.User.create({ name: 'bob' });
++
++        const result = await new Promise<string>(resolve => {
++          setTimeout(async () => {
++            const clsTransaction = vars.clsSequelize.getCurrentClsTransaction();
++            if (clsTransaction) {
++              const users = await vars.User.findAll();
++              resolve(`found:${users.length},tx:${clsTransaction.id}`);
++            } else {
++              resolve('no-tx');
++            }
++          }, 10);
++        });
++
++        expect(result).to.include('found:1');
++        expect(result).to.include(`tx:${t.id}`);
++      });
++    });
++
++    it('manual transaction parameter takes priority over CLS context', async () => {
++      const manualTx = await vars.clsSequelize.startUnmanagedTransaction();
++
++      try {
++        await vars.clsSequelize.transaction(async autoTx => {
++          await vars.User.create({ name: 'in-auto-tx' }, { transaction: manualTx });
++          await vars.User.create({ name: 'in-auto-tx-cls' });
++
++          const manualResults = await vars.User.findAll({ transaction: manualTx });
++          const clsResults = await vars.User.findAll({});
++
++          expect(manualResults).to.have.length(1);
++          expect(manualResults[0].name).to.equal('in-auto-tx');
++          expect(clsResults).to.have.length(1);
++          expect(clsResults[0].name).to.equal('in-auto-tx-cls');
++        });
++
++        await manualTx.rollback();
++      } catch (err) {
++        await manualTx.rollback();
++        throw err;
++      }
++    });
++
++    it('nested transaction context propagates correctly', async () => {
++      await vars.clsSequelize.transaction(async t1 => {
++        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t1);
++
++        await vars.clsSequelize.transaction({ nestMode: 'savepoint' }, async t2 => {
++          expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t2);
++
++          await vars.User.create({ name: 'nested' });
++
++          const users = await vars.User.findAll();
++          expect(users).to.have.length(1);
++        });
++
++        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t1);
++      });
++    });
++
++    it('queries run in autocommit mode when no transaction is active', async () => {
++      expect(vars.clsSequelize.getCurrentClsTransaction()).to.be.undefined;
++
++      await vars.User.create({ name: 'no-tx' });
++
++      const users = await vars.User.findAll();
++      expect(users).to.have.length(1);
++      expect(users[0].name).to.equal('no-tx');
++    });
++
++    it('transaction context is preserved across multiple Promise.all queries', async () => {
++      await vars.clsSequelize.transaction(async t => {
++        await Promise.all([
++          vars.User.create({ name: 'user1' }),
++          vars.User.create({ name: 'user2' }),
++          vars.User.create({ name: 'user3' }),
++        ]);
++
++        const [count, users, one] = await Promise.all([
++          vars.User.count(),
++          vars.User.findAll(),
++          vars.User.findOne({ where: { name: 'user2' } }),
++        ]);
++
++        expect(count).to.equal(3);
++        expect(users).to.have.length(3);
++        expect(one).to.be.ok;
++        expect(one!.name).to.equal('user2');
++        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t);
++      });
++    });
++
++    it('findAndCountAll propagates transaction in Promise.all', async () => {
++      await vars.clsSequelize.transaction(async t => {
++        await vars.User.create({ name: 'fac' });
++
++        const result = await vars.User.findAndCountAll({});
++
++        expect(result.count).to.equal(1);
++        expect(result.rows).to.have.length(1);
++        expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(t);
++      });
++    });
++
++    it('runInClsContext binds unmanaged transaction to CLS', async () => {
++      const tx = await vars.clsSequelize.startUnmanagedTransaction();
++
++      try {
++        expect(vars.clsSequelize.getCurrentClsTransaction()).to.be.undefined;
++
++        await tx.runInClsContext(async () => {
++          expect(vars.clsSequelize.getCurrentClsTransaction()).to.equal(tx);
++
++          await vars.User.create({ name: 'via-runInClsContext' });
++
++          const users = await vars.User.findAll();
++          expect(users).to.have.length(1);
++        });
++
++        expect(vars.clsSequelize.getCurrentClsTransaction()).to.be.undefined;
++      } finally {
++        await tx.rollback();
++      }
++    });
++  });
+ });
