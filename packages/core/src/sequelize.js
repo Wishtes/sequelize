@@ -225,6 +225,7 @@ export class Sequelize extends SequelizeTypeScript {
    */
   async query(sql, options) {
     options = { ...this.options.query, ...options };
+    setTransactionFromCls(options, this);
 
     if (sql instanceof BaseSqlExpression) {
       sql = this.queryGenerator.formatSqlExpression(sql, options);

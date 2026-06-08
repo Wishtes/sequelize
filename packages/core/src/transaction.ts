@@ -605,8 +605,14 @@ export function normalizeTransactionOptions(
 ): NormalizedTransactionOptions {
   assertSupportedTransactionOptions(sequelize, options);
 
+  let transaction = options.transaction;
+  if (transaction === undefined) {
+    transaction = sequelize.getCurrentClsTransaction();
+  }
+
   return {
     ...options,
+    transaction,
     transactionType:
       options.type ??
       (sequelize.dialect.supports.startTransaction.transactionType

@@ -1604,6 +1604,7 @@ ${associationOwner._getAssociationDebugList()}`);
    */
   static async aggregate(attribute, aggregateFunction, options) {
     options = cloneDeep(options) ?? {};
+    setTransactionFromCls(options, this.sequelize);
     options.model = this;
 
     // We need to preserve attributes here as the `injectScope` call would inject non aggregate columns.
@@ -3260,6 +3261,7 @@ Instead of specifying a Model, either:
    */
   static async increment(fields, options) {
     options ||= {};
+    setTransactionFromCls(options, this.sequelize);
     if (typeof fields === 'string') {
       fields = [fields];
     }

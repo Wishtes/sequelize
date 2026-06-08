@@ -1,0 +1,51 @@
+diff --git a/packages/core/src/model.js b/packages/core/src/model.js
+index 6a2f98ada..e4a636682 100644
+--- a/packages/core/src/model.js
++++ b/packages/core/src/model.js
+@@ -1604,6 +1604,7 @@ ${associationOwner._getAssociationDebugList()}`);
+    */
+   static async aggregate(attribute, aggregateFunction, options) {
+     options = cloneDeep(options) ?? {};
++    setTransactionFromCls(options, this.sequelize);
+     options.model = this;
+ 
+     // We need to preserve attributes here as the `injectScope` call would inject non aggregate columns.
+@@ -3260,6 +3261,7 @@ Instead of specifying a Model, either:
+    */
+   static async increment(fields, options) {
+     options ||= {};
++    setTransactionFromCls(options, this.sequelize);
+     if (typeof fields === 'string') {
+       fields = [fields];
+     }
+diff --git a/packages/core/src/sequelize.js b/packages/core/src/sequelize.js
+index 763ad7383..56dd2b4be 100644
+--- a/packages/core/src/sequelize.js
++++ b/packages/core/src/sequelize.js
+@@ -225,6 +225,7 @@ export class Sequelize extends SequelizeTypeScript {
+    */
+   async query(sql, options) {
+     options = { ...this.options.query, ...options };
++    setTransactionFromCls(options, this);
+ 
+     if (sql instanceof BaseSqlExpression) {
+       sql = this.queryGenerator.formatSqlExpression(sql, options);
+diff --git a/packages/core/src/transaction.ts b/packages/core/src/transaction.ts
+index 1ea26dfa8..4c4a35693 100644
+--- a/packages/core/src/transaction.ts
++++ b/packages/core/src/transaction.ts
+@@ -605,8 +605,14 @@ export function normalizeTransactionOptions(
+ ): NormalizedTransactionOptions {
+   assertSupportedTransactionOptions(sequelize, options);
+ 
++  let transaction = options.transaction;
++  if (transaction === undefined) {
++    transaction = sequelize.getCurrentClsTransaction();
++  }
++
+   return {
+     ...options,
++    transaction,
+     transactionType:
+       options.type ??
+       (sequelize.dialect.supports.startTransaction.transactionType
