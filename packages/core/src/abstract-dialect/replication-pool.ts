@@ -39,6 +39,28 @@ export interface ReplicationPoolOptions {
   maxUses: number;
 }
 
+export interface HealthCheckConfig<Connection extends object> {
+  /**
+   * Whether health checks are enabled
+   */
+  enabled: boolean;
+
+  /**
+   * Interval in milliseconds for idle connection health checks
+   */
+  idleCheckInterval: number;
+
+  /**
+   * Whether to perform health checks on connection acquire
+   */
+  acquireCheck: boolean;
+
+  /**
+   * Async function that performs the health check on a connection
+   */
+  healthCheck: (connection: Connection) => Promise<boolean>;
+}
+
 export interface AcquireConnectionOptions {
   /**
    * Set which replica to use. Available options are `read` and `write`
@@ -67,9 +89,13 @@ interface ReplicationPoolConfig<Connection extends object, ConnectionOptions ext
 
   beforeAcquire?(options: AcquireConnectionOptions): Promise<void>;
   afterAcquire?(connection: Connection, options: AcquireConnectionOptions): Promise<void>;
+
+  healthCheck?: HealthCheckConfig<Connection> | undefined;
 }
 
 const owningPools = new WeakMap<object, 'read' | 'write'>();
+
+const MAX_ACQUIRE_HEALTH_CHECK_RETRIES = 3;
 
 export class ReplicationPool<Connection extends object, ConnectionOptions extends object> {
   /**
@@ -84,6 +110,9 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
   readonly #afterAcquire:
     | ((connection: Connection, options: AcquireConnectionOptions) => Promise<void>)
     | undefined;
+  readonly #healthCheckConfig: HealthCheckConfig<Connection> | undefined;
+  #idleHealthCheckTimerId: ReturnType<typeof setInterval> | null = null;
+  #isIdleHealthCheckRunning = false;
 
   constructor(config: ReplicationPoolConfig<Connection, ConnectionOptions>) {
     const {
@@ -95,11 +124,13 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
       timeoutErrorClass,
       readConfig,
       writeConfig,
+      healthCheck,
     } = config;
 
     this.#beforeAcquire = beforeAcquire;
     this.#afterAcquire = afterAcquire;
     this.#timeoutErrorClass = timeoutErrorClass;
+    this.#healthCheckConfig = healthCheck;
 
     if (!readConfig || readConfig.length === 0) {
       // no replication, the write pool will always be used instead
@@ -153,6 +184,89 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
     } else {
       debug(`pool created with max/min: ${config.pool.max}/${config.pool.min}, with replication`);
     }
+
+    if (healthCheck?.enabled && healthCheck.idleCheckInterval > 0 && isFinite(healthCheck.idleCheckInterval)) {
+      this.#startIdleHealthCheck(healthCheck.idleCheckInterval);
+    }
+  }
+
+  #startIdleHealthCheck(interval: number): void {
+    if (this.#idleHealthCheckTimerId !== null) {
+      return;
+    }
+
+    debug(`starting idle health check with interval ${interval}ms`);
+
+    this.#idleHealthCheckTimerId = setInterval(() => {
+      this.#runIdleHealthCheck().catch((error: unknown) => {
+        debug(`idle health check error: ${error}`);
+      });
+    }, interval);
+
+    if (this.#idleHealthCheckTimerId && typeof this.#idleHealthCheckTimerId === 'object' && 'unref' in this.#idleHealthCheckTimerId) {
+      (this.#idleHealthCheckTimerId as { unref(): void }).unref();
+    }
+  }
+
+  async #runIdleHealthCheck(): Promise<void> {
+    if (this.#isIdleHealthCheckRunning) {
+      return;
+    }
+
+    this.#isIdleHealthCheckRunning = true;
+
+    try {
+      await this.#checkPoolIdleConnections(this.write);
+      if (this.read) {
+        await this.#checkPoolIdleConnections(this.read);
+      }
+    } finally {
+      this.#isIdleHealthCheckRunning = false;
+    }
+  }
+
+  async #checkPoolIdleConnections(pool: Pool<Connection>): Promise<void> {
+    const healthCheckFn = this.#healthCheckConfig?.healthCheck;
+    if (!healthCheckFn) {
+      return;
+    }
+
+    const availableCount = pool.available;
+    if (availableCount === 0) {
+      return;
+    }
+
+    debug(`checking ${availableCount} idle connections`);
+
+    const connectionsToCheck: Connection[] = [];
+
+    for (let i = 0; i < availableCount; i++) {
+      try {
+        const connection = await pool.acquire();
+        connectionsToCheck.push(connection);
+      } catch {
+        break;
+      }
+    }
+
+    for (const connection of connectionsToCheck) {
+      try {
+        const isHealthy = await healthCheckFn(connection);
+        if (isHealthy) {
+          pool.release(connection);
+        } else {
+          debug('idle health check failed, destroying connection');
+          await pool.destroy(connection);
+        }
+      } catch {
+        debug('idle health check error, destroying connection');
+        try {
+          await pool.destroy(connection);
+        } catch {
+          // connection may already be destroyed
+        }
+      }
+    }
   }
 
   async acquire(options?: AcquireConnectionOptions | undefined) {
@@ -181,6 +295,55 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
 
     await this.#afterAcquire?.(connection, options);
 
+    if (this.#healthCheckConfig?.enabled && this.#healthCheckConfig?.acquireCheck) {
+      connection = await this.#acquireWithHealthCheck(pool, connection, options);
+    }
+
+    return connection;
+  }
+
+  async #acquireWithHealthCheck(
+    pool: Pool<Connection>,
+    connection: Connection,
+    options: AcquireConnectionOptions,
+  ): Promise<Connection> {
+    const healthCheckFn = this.#healthCheckConfig?.healthCheck;
+    if (!healthCheckFn) {
+      return connection;
+    }
+
+    for (let attempt = 0; attempt < MAX_ACQUIRE_HEALTH_CHECK_RETRIES; attempt++) {
+      try {
+        const isHealthy = await healthCheckFn(connection);
+        if (isHealthy) {
+          return connection;
+        }
+
+        debug('acquire health check failed, destroying connection and retrying');
+        await pool.destroy(connection);
+      } catch {
+        debug('acquire health check error, destroying connection and retrying');
+        try {
+          await pool.destroy(connection);
+        } catch {
+          // connection may already be destroyed
+        }
+      }
+
+      try {
+        connection = await pool.acquire();
+        await this.#afterAcquire?.(connection, options);
+      } catch (error) {
+        if (this.#timeoutErrorClass && error instanceof TimeoutError) {
+          throw new this.#timeoutErrorClass(error.message, { cause: error });
+        }
+
+        throw error;
+      }
+    }
+
+    debug('acquire health check failed after max retries, returning connection as-is');
+
     return connection;
   }
 
@@ -204,13 +367,23 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
   }
 
   async destroyAllNow() {
+    this.#stopIdleHealthCheck();
     await Promise.all([this.read?.destroyAllNow(), this.write.destroyAllNow()]);
 
     debug('all connections destroyed');
   }
 
   async drain() {
+    this.#stopIdleHealthCheck();
     await Promise.all([this.write.drain(), this.read?.drain()]);
+  }
+
+  #stopIdleHealthCheck(): void {
+    if (this.#idleHealthCheckTimerId !== null) {
+      clearInterval(this.#idleHealthCheckTimerId);
+      this.#idleHealthCheckTimerId = null;
+      debug('idle health check stopped');
+    }
   }
 
   getPool(poolType: ConnectionType): Pool<Connection> {

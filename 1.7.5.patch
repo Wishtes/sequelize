@@ -1,0 +1,449 @@
+diff --git a/packages/core/src/abstract-dialect/connection-manager.ts b/packages/core/src/abstract-dialect/connection-manager.ts
+index af50bd460..d031527f2 100644
+--- a/packages/core/src/abstract-dialect/connection-manager.ts
++++ b/packages/core/src/abstract-dialect/connection-manager.ts
+@@ -1,4 +1,5 @@
+ import type { AbstractDialect, ConnectionOptions } from './dialect.js';
++import { QueryTypes } from '../enums.js';
+ 
+ export interface GetConnectionOptions {
+   /**
+@@ -64,6 +65,43 @@ export class AbstractConnectionManager<
+     throw new Error(`validate not implemented in ${this.constructor.name}`);
+   }
+ 
++  /**
++   * Perform an asynchronous health check on a connection by executing a lightweight SQL query.
++   *
++   * Unlike the synchronous {@link validate} method which only checks connection properties,
++   * this method executes an actual query against the database to verify the connection is
++   * truly alive. This is essential for detecting connections that have been broken due to
++   * database server restarts, network interruptions, or other issues that may not be
++   * reflected in the connection's internal state.
++   *
++   * The default implementation executes a `SELECT 1+1` query, using the dialect-appropriate
++   * dummy table if needed (e.g., `DUAL` for Oracle, `SYSIBM.SYSDUMMY1` for IBMi).
++   * Dialect implementations can override this method to provide a more efficient
++   * or dialect-specific health check.
++   *
++   * @param connection The connection to check
++   * @returns `true` if the connection is healthy, `false` if it should be removed from the pool
++   */
++  async healthCheck(connection: TConnection): Promise<boolean> {
++    try {
++      const dummyTableName = this.dialect.supports.select.dummyTable;
++      const fromClause = dummyTableName
++        ? ` FROM ${this.sequelize.queryGenerator.quoteIdentifier(dummyTableName)}`
++        : '';
++
++      await this.sequelize.queryRaw(`SELECT 1+1 AS result${fromClause}`, {
++        connection,
++        type: QueryTypes.SELECT,
++        logging: false,
++        retry: { max: 0 },
++      });
++
++      return true;
++    } catch {
++      return false;
++    }
++  }
++
+   async connect(_config: ConnectionOptions<Dialect>): Promise<TConnection> {
+     throw new Error(`connect not implemented in ${this.constructor.name}`);
+   }
+diff --git a/packages/core/src/abstract-dialect/replication-pool.ts b/packages/core/src/abstract-dialect/replication-pool.ts
+index 478804cf9..26b48602a 100644
+--- a/packages/core/src/abstract-dialect/replication-pool.ts
++++ b/packages/core/src/abstract-dialect/replication-pool.ts
+@@ -39,6 +39,28 @@ export interface ReplicationPoolOptions {
+   maxUses: number;
+ }
+ 
++export interface HealthCheckConfig<Connection extends object> {
++  /**
++   * Whether health checks are enabled
++   */
++  enabled: boolean;
++
++  /**
++   * Interval in milliseconds for idle connection health checks
++   */
++  idleCheckInterval: number;
++
++  /**
++   * Whether to perform health checks on connection acquire
++   */
++  acquireCheck: boolean;
++
++  /**
++   * Async function that performs the health check on a connection
++   */
++  healthCheck: (connection: Connection) => Promise<boolean>;
++}
++
+ export interface AcquireConnectionOptions {
+   /**
+    * Set which replica to use. Available options are `read` and `write`
+@@ -67,10 +89,14 @@ interface ReplicationPoolConfig<Connection extends object, ConnectionOptions ext
+ 
+   beforeAcquire?(options: AcquireConnectionOptions): Promise<void>;
+   afterAcquire?(connection: Connection, options: AcquireConnectionOptions): Promise<void>;
++
++  healthCheck?: HealthCheckConfig<Connection> | undefined;
+ }
+ 
+ const owningPools = new WeakMap<object, 'read' | 'write'>();
+ 
++const MAX_ACQUIRE_HEALTH_CHECK_RETRIES = 3;
++
+ export class ReplicationPool<Connection extends object, ConnectionOptions extends object> {
+   /**
+    * Replication read pool. Will only be used if the 'read' replication option has been provided,
+@@ -84,6 +110,9 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
+   readonly #afterAcquire:
+     | ((connection: Connection, options: AcquireConnectionOptions) => Promise<void>)
+     | undefined;
++  readonly #healthCheckConfig: HealthCheckConfig<Connection> | undefined;
++  #idleHealthCheckTimerId: ReturnType<typeof setInterval> | null = null;
++  #isIdleHealthCheckRunning = false;
+ 
+   constructor(config: ReplicationPoolConfig<Connection, ConnectionOptions>) {
+     const {
+@@ -95,11 +124,13 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
+       timeoutErrorClass,
+       readConfig,
+       writeConfig,
++      healthCheck,
+     } = config;
+ 
+     this.#beforeAcquire = beforeAcquire;
+     this.#afterAcquire = afterAcquire;
+     this.#timeoutErrorClass = timeoutErrorClass;
++    this.#healthCheckConfig = healthCheck;
+ 
+     if (!readConfig || readConfig.length === 0) {
+       // no replication, the write pool will always be used instead
+@@ -153,6 +184,89 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
+     } else {
+       debug(`pool created with max/min: ${config.pool.max}/${config.pool.min}, with replication`);
+     }
++
++    if (healthCheck?.enabled && healthCheck.idleCheckInterval > 0 && isFinite(healthCheck.idleCheckInterval)) {
++      this.#startIdleHealthCheck(healthCheck.idleCheckInterval);
++    }
++  }
++
++  #startIdleHealthCheck(interval: number): void {
++    if (this.#idleHealthCheckTimerId !== null) {
++      return;
++    }
++
++    debug(`starting idle health check with interval ${interval}ms`);
++
++    this.#idleHealthCheckTimerId = setInterval(() => {
++      this.#runIdleHealthCheck().catch((error: unknown) => {
++        debug(`idle health check error: ${error}`);
++      });
++    }, interval);
++
++    if (this.#idleHealthCheckTimerId && typeof this.#idleHealthCheckTimerId === 'object' && 'unref' in this.#idleHealthCheckTimerId) {
++      (this.#idleHealthCheckTimerId as { unref(): void }).unref();
++    }
++  }
++
++  async #runIdleHealthCheck(): Promise<void> {
++    if (this.#isIdleHealthCheckRunning) {
++      return;
++    }
++
++    this.#isIdleHealthCheckRunning = true;
++
++    try {
++      await this.#checkPoolIdleConnections(this.write);
++      if (this.read) {
++        await this.#checkPoolIdleConnections(this.read);
++      }
++    } finally {
++      this.#isIdleHealthCheckRunning = false;
++    }
++  }
++
++  async #checkPoolIdleConnections(pool: Pool<Connection>): Promise<void> {
++    const healthCheckFn = this.#healthCheckConfig?.healthCheck;
++    if (!healthCheckFn) {
++      return;
++    }
++
++    const availableCount = pool.available;
++    if (availableCount === 0) {
++      return;
++    }
++
++    debug(`checking ${availableCount} idle connections`);
++
++    const connectionsToCheck: Connection[] = [];
++
++    for (let i = 0; i < availableCount; i++) {
++      try {
++        const connection = await pool.acquire();
++        connectionsToCheck.push(connection);
++      } catch {
++        break;
++      }
++    }
++
++    for (const connection of connectionsToCheck) {
++      try {
++        const isHealthy = await healthCheckFn(connection);
++        if (isHealthy) {
++          pool.release(connection);
++        } else {
++          debug('idle health check failed, destroying connection');
++          await pool.destroy(connection);
++        }
++      } catch {
++        debug('idle health check error, destroying connection');
++        try {
++          await pool.destroy(connection);
++        } catch {
++          // connection may already be destroyed
++        }
++      }
++    }
+   }
+ 
+   async acquire(options?: AcquireConnectionOptions | undefined) {
+@@ -181,6 +295,55 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
+ 
+     await this.#afterAcquire?.(connection, options);
+ 
++    if (this.#healthCheckConfig?.enabled && this.#healthCheckConfig?.acquireCheck) {
++      connection = await this.#acquireWithHealthCheck(pool, connection, options);
++    }
++
++    return connection;
++  }
++
++  async #acquireWithHealthCheck(
++    pool: Pool<Connection>,
++    connection: Connection,
++    options: AcquireConnectionOptions,
++  ): Promise<Connection> {
++    const healthCheckFn = this.#healthCheckConfig?.healthCheck;
++    if (!healthCheckFn) {
++      return connection;
++    }
++
++    for (let attempt = 0; attempt < MAX_ACQUIRE_HEALTH_CHECK_RETRIES; attempt++) {
++      try {
++        const isHealthy = await healthCheckFn(connection);
++        if (isHealthy) {
++          return connection;
++        }
++
++        debug('acquire health check failed, destroying connection and retrying');
++        await pool.destroy(connection);
++      } catch {
++        debug('acquire health check error, destroying connection and retrying');
++        try {
++          await pool.destroy(connection);
++        } catch {
++          // connection may already be destroyed
++        }
++      }
++
++      try {
++        connection = await pool.acquire();
++        await this.#afterAcquire?.(connection, options);
++      } catch (error) {
++        if (this.#timeoutErrorClass && error instanceof TimeoutError) {
++          throw new this.#timeoutErrorClass(error.message, { cause: error });
++        }
++
++        throw error;
++      }
++    }
++
++    debug('acquire health check failed after max retries, returning connection as-is');
++
+     return connection;
+   }
+ 
+@@ -204,15 +367,25 @@ export class ReplicationPool<Connection extends object, ConnectionOptions extend
+   }
+ 
+   async destroyAllNow() {
++    this.#stopIdleHealthCheck();
+     await Promise.all([this.read?.destroyAllNow(), this.write.destroyAllNow()]);
+ 
+     debug('all connections destroyed');
+   }
+ 
+   async drain() {
++    this.#stopIdleHealthCheck();
+     await Promise.all([this.write.drain(), this.read?.drain()]);
+   }
+ 
++  #stopIdleHealthCheck(): void {
++    if (this.#idleHealthCheckTimerId !== null) {
++      clearInterval(this.#idleHealthCheckTimerId);
++      this.#idleHealthCheckTimerId = null;
++      debug('idle health check stopped');
++    }
++  }
++
+   getPool(poolType: ConnectionType): Pool<Connection> {
+     if (poolType === 'read' && this.read != null) {
+       return this.read;
+diff --git a/packages/core/src/index.d.ts b/packages/core/src/index.d.ts
+index c8c4904ba..eefde2f59 100644
+--- a/packages/core/src/index.d.ts
++++ b/packages/core/src/index.d.ts
+@@ -41,7 +41,7 @@ export * from './abstract-dialect/query-generator.types.js';
+ export * from './abstract-dialect/query-interface.js';
+ export * from './abstract-dialect/query-interface.types.js';
+ export * from './abstract-dialect/query.js';
+-export type { AcquireConnectionOptions } from './abstract-dialect/replication-pool.js';
++export type { AcquireConnectionOptions, HealthCheckConfig } from './abstract-dialect/replication-pool.js';
+ export type { WhereOptions } from './abstract-dialect/where-sql-builder-types.js';
+ export * from './associations/index.js';
+ export * as DataTypes from './data-types.js';
+@@ -88,7 +88,7 @@ export {
+ } from './transaction.js';
+ // eslint-disable-next-line import/no-default-export -- legacy, will be removed in the future | TODO [>=8]: remove this alias
+ export { Sequelize as default } from './sequelize.js';
+-export type { NormalizedOptions, Options, PoolOptions } from './sequelize.types.js';
++export type { HealthCheckOptions, NormalizedOptions, Options, PoolOptions } from './sequelize.types.js';
+ export { isModelStatic, isSameInitialModel } from './utils/model-utils.js';
+ export { useInflection } from './utils/string.js';
+ export type { Validator } from './utils/validator-extras.js';
+diff --git a/packages/core/src/sequelize-typescript.ts b/packages/core/src/sequelize-typescript.ts
+index 772569e23..c5d5d4e4b 100644
+--- a/packages/core/src/sequelize-typescript.ts
++++ b/packages/core/src/sequelize-typescript.ts
+@@ -692,6 +692,16 @@ Connection options can be used at the root of the option bag, in the "replicatio
+ 
+         return this.dialect.connectionManager.validate(connection);
+       },
++      healthCheck: options.pool?.healthCheck
++        ? {
++            enabled: options.pool.healthCheck.enabled !== false,
++            idleCheckInterval: options.pool.healthCheck.idleCheckInterval ?? 30_000,
++            acquireCheck: options.pool.healthCheck.acquireCheck ?? false,
++            healthCheck: options.pool.healthCheck.healthCheck
++              ? (connection: Connection<Dialect>) => options.pool!.healthCheck!.healthCheck!(connection)
++              : (connection: Connection<Dialect>) => this.dialect.connectionManager.healthCheck(connection),
++          }
++        : undefined,
+       beforeAcquire: async (acquireOptions: AcquireConnectionOptions): Promise<void> => {
+         return this.hooks.runAsync('beforePoolAcquire', acquireOptions);
+       },
+diff --git a/packages/core/src/sequelize.types.ts b/packages/core/src/sequelize.types.ts
+index d136b0120..a99569131 100644
+--- a/packages/core/src/sequelize.types.ts
++++ b/packages/core/src/sequelize.types.ts
+@@ -12,6 +12,69 @@ import type {
+ } from './sequelize.internals.js';
+ import type { NormalizedReplicationOptions } from './sequelize.js';
+ 
++/**
++ * Health check options for the connection pool.
++ *
++ * Used in {@link PoolOptions.healthCheck}
++ */
++export interface HealthCheckOptions<Dialect extends AbstractDialect> {
++  /**
++   * Enable or disable connection health checks.
++   *
++   * When enabled, Sequelize will periodically check idle connections and validate
++   * connections when they are acquired from the pool. Invalid connections are
++   * automatically removed and replaced with new ones.
++   *
++   * This is useful for detecting connections that have been broken due to
++   * database server restarts, network interruptions, or other issues that
++   * may not be detected by the synchronous `validate` function alone.
++   *
++   * @default true
++   */
++  enabled?: boolean | undefined;
++
++  /**
++   * The interval in milliseconds at which idle connections are checked for health.
++   *
++   * On each interval, a limited number of idle connections will be acquired from the pool,
++   * tested with a lightweight SQL query (e.g. `SELECT 1+1`), and destroyed if the query fails.
++   * The pool will automatically create new connections to replace the destroyed ones.
++   *
++   * Set to `0` or `Infinity` to disable idle health checks.
++   *
++   * @default 30000
++   */
++  idleCheckInterval?: number | undefined;
++
++  /**
++   * Enable or disable health checks when a connection is acquired from the pool.
++   *
++   * When enabled, after a connection is acquired from the pool (and passes the synchronous
++   * `validate` check), an asynchronous health check query is executed. If the query fails,
++   * the connection is destroyed and a new one is acquired automatically.
++   *
++   * This provides stronger guarantees than the synchronous `validate` alone, as it can
++   * detect connections that appear valid but are actually broken (e.g., after a server restart).
++   *
++   * Note: Enabling this adds a small overhead to each connection acquisition.
++   *
++   * @default false
++   */
++  acquireCheck?: boolean | undefined;
++
++  /**
++   * A custom function that performs an asynchronous health check on a connection.
++   *
++   * If provided, this overrides the default health check implementation.
++   * The function should return `true` if the connection is healthy, or `false` if it should be
++   * removed from the pool.
++   *
++   * The default implementation executes a `SELECT 1+1` query (with the dialect-appropriate
++   * dummy table if needed) on the connection.
++   */
++  healthCheck?: ((connection?: Connection<Dialect>) => Promise<boolean>) | undefined;
++}
++
+ /**
+  * Connection Pool options.
+  *
+@@ -25,6 +88,33 @@ export interface PoolOptions<Dialect extends AbstractDialect>
+    * If provided, this overrides the default connection validation built in to sequelize.
+    */
+   validate?: ((connection?: Connection<Dialect>) => boolean) | undefined;
++
++  /**
++   * Health check options for the connection pool.
++   *
++   * Health checks provide an additional layer of connection validation beyond the
++   * synchronous `validate` function. They can execute actual SQL queries to verify
++   * that a connection is truly alive, which is important for detecting connections
++   * that have been broken due to database server restarts or network interruptions.
++   *
++   * Two modes are supported:
++   * - **Idle check**: Periodically validates idle connections in the pool
++   * - **Acquire check**: Validates connections when they are acquired from the pool
++   *
++   * @example
++   * ```js
++   * const sequelize = new Sequelize({
++   *   pool: {
++   *     healthCheck: {
++   *       enabled: true,
++   *       idleCheckInterval: 30000,
++   *       acquireCheck: false,
++   *     },
++   *   },
++   * });
++   * ```
++   */
++  healthCheck?: HealthCheckOptions<Dialect> | undefined;
+ }
+ 
+ /**

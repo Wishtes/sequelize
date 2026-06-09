@@ -1,4 +1,5 @@
 import type { AbstractDialect, ConnectionOptions } from './dialect.js';
+import { QueryTypes } from '../enums.js';
 
 export interface GetConnectionOptions {
   /**
@@ -62,6 +63,43 @@ export class AbstractConnectionManager<
    */
   validate(_connection: TConnection): boolean {
     throw new Error(`validate not implemented in ${this.constructor.name}`);
+  }
+
+  /**
+   * Perform an asynchronous health check on a connection by executing a lightweight SQL query.
+   *
+   * Unlike the synchronous {@link validate} method which only checks connection properties,
+   * this method executes an actual query against the database to verify the connection is
+   * truly alive. This is essential for detecting connections that have been broken due to
+   * database server restarts, network interruptions, or other issues that may not be
+   * reflected in the connection's internal state.
+   *
+   * The default implementation executes a `SELECT 1+1` query, using the dialect-appropriate
+   * dummy table if needed (e.g., `DUAL` for Oracle, `SYSIBM.SYSDUMMY1` for IBMi).
+   * Dialect implementations can override this method to provide a more efficient
+   * or dialect-specific health check.
+   *
+   * @param connection The connection to check
+   * @returns `true` if the connection is healthy, `false` if it should be removed from the pool
+   */
+  async healthCheck(connection: TConnection): Promise<boolean> {
+    try {
+      const dummyTableName = this.dialect.supports.select.dummyTable;
+      const fromClause = dummyTableName
+        ? ` FROM ${this.sequelize.queryGenerator.quoteIdentifier(dummyTableName)}`
+        : '';
+
+      await this.sequelize.queryRaw(`SELECT 1+1 AS result${fromClause}`, {
+        connection,
+        type: QueryTypes.SELECT,
+        logging: false,
+        retry: { max: 0 },
+      });
+
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async connect(_config: ConnectionOptions<Dialect>): Promise<TConnection> {

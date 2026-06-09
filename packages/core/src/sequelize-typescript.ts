@@ -692,6 +692,16 @@ Connection options can be used at the root of the option bag, in the "replicatio
 
         return this.dialect.connectionManager.validate(connection);
       },
+      healthCheck: options.pool?.healthCheck
+        ? {
+            enabled: options.pool.healthCheck.enabled !== false,
+            idleCheckInterval: options.pool.healthCheck.idleCheckInterval ?? 30_000,
+            acquireCheck: options.pool.healthCheck.acquireCheck ?? false,
+            healthCheck: options.pool.healthCheck.healthCheck
+              ? (connection: Connection<Dialect>) => options.pool!.healthCheck!.healthCheck!(connection)
+              : (connection: Connection<Dialect>) => this.dialect.connectionManager.healthCheck(connection),
+          }
+        : undefined,
       beforeAcquire: async (acquireOptions: AcquireConnectionOptions): Promise<void> => {
         return this.hooks.runAsync('beforePoolAcquire', acquireOptions);
       },

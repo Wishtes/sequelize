@@ -41,7 +41,7 @@ export * from './abstract-dialect/query-generator.types.js';
 export * from './abstract-dialect/query-interface.js';
 export * from './abstract-dialect/query-interface.types.js';
 export * from './abstract-dialect/query.js';
-export type { AcquireConnectionOptions } from './abstract-dialect/replication-pool.js';
+export type { AcquireConnectionOptions, HealthCheckConfig } from './abstract-dialect/replication-pool.js';
 export type { WhereOptions } from './abstract-dialect/where-sql-builder-types.js';
 export * from './associations/index.js';
 export * as DataTypes from './data-types.js';
@@ -88,7 +88,7 @@ export {
 } from './transaction.js';
 // eslint-disable-next-line import/no-default-export -- legacy, will be removed in the future | TODO [>=8]: remove this alias
 export { Sequelize as default } from './sequelize.js';
-export type { NormalizedOptions, Options, PoolOptions } from './sequelize.types.js';
+export type { HealthCheckOptions, NormalizedOptions, Options, PoolOptions } from './sequelize.types.js';
 export { isModelStatic, isSameInitialModel } from './utils/model-utils.js';
 export { useInflection } from './utils/string.js';
 export type { Validator } from './utils/validator-extras.js';
