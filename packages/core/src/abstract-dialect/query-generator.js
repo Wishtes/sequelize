@@ -35,7 +35,7 @@ import { nameIndex, spliceStr } from '../utils/string';
 import { attributeTypeToSql } from './data-types-utils';
 import { AbstractQueryGeneratorInternal } from './query-generator-internal.js';
 import { AbstractQueryGeneratorTypeScript } from './query-generator-typescript';
-import { joinWithLogicalOperator } from './where-sql-builder';
+import { joinWithLogicalOperator, parseJsonPathString } from './where-sql-builder';
 
 export const CREATE_TABLE_QUERY_SUPPORTABLE_OPTIONS = new Set([
   'collate',
@@ -913,24 +913,34 @@ export class AbstractQueryGenerator extends AbstractQueryGeneratorTypeScript {
             } else if (previousModelDefinition.attributes.has(item)) {
               // convert the item attribute from its alias
               item = previousModelDefinition.attributes.get(item).columnName;
-            } else if (item.includes('.')) {
-              const itemSplit = item.split('.');
+            } else if (item.includes('.') || /\[\d+\]/.test(item)) {
+              const parsed = parseJsonPathString(item);
+              if (parsed) {
+                const jsonAttribute = previousModelDefinition.attributes.get(parsed.columnName);
+                if (jsonAttribute && jsonAttribute.type instanceof DataTypes.JSON) {
+                  const identifier = this.quoteIdentifiers(
+                    `${previousModel.name}.${jsonAttribute.columnName}`,
+                  );
 
-              const jsonAttribute = previousModelDefinition.attributes.get(itemSplit[0]);
-              if (jsonAttribute.type instanceof DataTypes.JSON) {
-                // just quote identifiers for now
-                const identifier = this.quoteIdentifiers(
-                  `${previousModel.name}.${jsonAttribute.columnName}`,
-                );
+                  item = this.jsonPathExtractionQuery(identifier, parsed.pathSegments);
 
-                // get path
-                const path = itemSplit.slice(1);
+                  item = new Literal(item);
+                }
+              } else {
+                const itemSplit = item.split('.');
 
-                // extract path
-                item = this.jsonPathExtractionQuery(identifier, path);
+                const jsonAttribute = previousModelDefinition.attributes.get(itemSplit[0]);
+                if (jsonAttribute && jsonAttribute.type instanceof DataTypes.JSON) {
+                  const identifier = this.quoteIdentifiers(
+                    `${previousModel.name}.${jsonAttribute.columnName}`,
+                  );
 
-                // literal because we don't want to append the model name when string
-                item = new Literal(item);
+                  const path = itemSplit.slice(1);
+
+                  item = this.jsonPathExtractionQuery(identifier, path);
+
+                  item = new Literal(item);
+                }
               }
             }
           }
@@ -1013,6 +1023,15 @@ export class AbstractQueryGenerator extends AbstractQueryGeneratorTypeScript {
    * @returns {string}
    */
   quoteIdentifiers(identifiers) {
+    if (typeof identifiers === 'string' && /\[\d+\]/.test(identifiers)) {
+      const parsed = parseJsonPathString(identifiers);
+      if (parsed) {
+        const quotedColumn = this.quoteIdentifier(parsed.columnName);
+
+        return this.jsonPathExtractionQuery(quotedColumn, parsed.pathSegments, false);
+      }
+    }
+
     if (identifiers.includes('.')) {
       identifiers = identifiers.split('.');
 

@@ -1,0 +1,336 @@
+diff --git a/packages/core/src/abstract-dialect/query-generator-internal.ts b/packages/core/src/abstract-dialect/query-generator-internal.ts
+index 45028f176..e3bb3997d 100644
+--- a/packages/core/src/abstract-dialect/query-generator-internal.ts
++++ b/packages/core/src/abstract-dialect/query-generator-internal.ts
+@@ -330,15 +330,25 @@ Only named replacements (:name) are allowed in literal() because we cannot guara
+   }
+ 
+   formatCol(piece: Col, options?: EscapeOptions) {
+-    // TODO: can this be removed?
+     if (piece.identifiers.length === 1 && piece.identifiers[0].startsWith('*')) {
+       return '*';
+     }
+ 
+-    // Weird legacy behavior
++    if (piece.jsonPath && piece.jsonPath.length > 0) {
++      let quotedColumn: string;
++      if (piece.identifiers.length === 1) {
++        quotedColumn = this.queryGenerator.quoteIdentifier(piece.identifiers[0]);
++      } else {
++        const table = piece.identifiers.slice(0, -1).join('->');
++        const column = piece.identifiers.at(-1)!;
++        quotedColumn = `${this.queryGenerator.quoteIdentifier(table)}.${this.queryGenerator.quoteIdentifier(column)}`;
++      }
++
++      return this.queryGenerator.jsonPathExtractionQuery(quotedColumn, piece.jsonPath, false);
++    }
++
+     const identifiers = piece.identifiers.length === 1 ? piece.identifiers[0] : piece.identifiers;
+ 
+-    // TODO: use quoteIdentifiers?
+     // @ts-expect-error -- quote is declared on child class
+     return this.queryGenerator.quote(identifiers, options?.model, undefined, options);
+   }
+diff --git a/packages/core/src/abstract-dialect/query-generator.js b/packages/core/src/abstract-dialect/query-generator.js
+index 20a525421..aa8c330fe 100644
+--- a/packages/core/src/abstract-dialect/query-generator.js
++++ b/packages/core/src/abstract-dialect/query-generator.js
+@@ -35,7 +35,7 @@ import { nameIndex, spliceStr } from '../utils/string';
+ import { attributeTypeToSql } from './data-types-utils';
+ import { AbstractQueryGeneratorInternal } from './query-generator-internal.js';
+ import { AbstractQueryGeneratorTypeScript } from './query-generator-typescript';
+-import { joinWithLogicalOperator } from './where-sql-builder';
++import { joinWithLogicalOperator, parseJsonPathString } from './where-sql-builder';
+ 
+ export const CREATE_TABLE_QUERY_SUPPORTABLE_OPTIONS = new Set([
+   'collate',
+@@ -913,24 +913,34 @@ export class AbstractQueryGenerator extends AbstractQueryGeneratorTypeScript {
+             } else if (previousModelDefinition.attributes.has(item)) {
+               // convert the item attribute from its alias
+               item = previousModelDefinition.attributes.get(item).columnName;
+-            } else if (item.includes('.')) {
+-              const itemSplit = item.split('.');
+-
+-              const jsonAttribute = previousModelDefinition.attributes.get(itemSplit[0]);
+-              if (jsonAttribute.type instanceof DataTypes.JSON) {
+-                // just quote identifiers for now
+-                const identifier = this.quoteIdentifiers(
+-                  `${previousModel.name}.${jsonAttribute.columnName}`,
+-                );
++            } else if (item.includes('.') || /\[\d+\]/.test(item)) {
++              const parsed = parseJsonPathString(item);
++              if (parsed) {
++                const jsonAttribute = previousModelDefinition.attributes.get(parsed.columnName);
++                if (jsonAttribute && jsonAttribute.type instanceof DataTypes.JSON) {
++                  const identifier = this.quoteIdentifiers(
++                    `${previousModel.name}.${jsonAttribute.columnName}`,
++                  );
++
++                  item = this.jsonPathExtractionQuery(identifier, parsed.pathSegments);
++
++                  item = new Literal(item);
++                }
++              } else {
++                const itemSplit = item.split('.');
+ 
+-                // get path
+-                const path = itemSplit.slice(1);
++                const jsonAttribute = previousModelDefinition.attributes.get(itemSplit[0]);
++                if (jsonAttribute && jsonAttribute.type instanceof DataTypes.JSON) {
++                  const identifier = this.quoteIdentifiers(
++                    `${previousModel.name}.${jsonAttribute.columnName}`,
++                  );
+ 
+-                // extract path
+-                item = this.jsonPathExtractionQuery(identifier, path);
++                  const path = itemSplit.slice(1);
+ 
+-                // literal because we don't want to append the model name when string
+-                item = new Literal(item);
++                  item = this.jsonPathExtractionQuery(identifier, path);
++
++                  item = new Literal(item);
++                }
+               }
+             }
+           }
+@@ -1013,6 +1023,15 @@ export class AbstractQueryGenerator extends AbstractQueryGeneratorTypeScript {
+    * @returns {string}
+    */
+   quoteIdentifiers(identifiers) {
++    if (typeof identifiers === 'string' && /\[\d+\]/.test(identifiers)) {
++      const parsed = parseJsonPathString(identifiers);
++      if (parsed) {
++        const quotedColumn = this.quoteIdentifier(parsed.columnName);
++
++        return this.jsonPathExtractionQuery(quotedColumn, parsed.pathSegments, false);
++      }
++    }
++
+     if (identifiers.includes('.')) {
+       identifiers = identifiers.split('.');
+ 
+diff --git a/packages/core/src/abstract-dialect/where-sql-builder.ts b/packages/core/src/abstract-dialect/where-sql-builder.ts
+index d55f992e4..deacdcfe9 100644
+--- a/packages/core/src/abstract-dialect/where-sql-builder.ts
++++ b/packages/core/src/abstract-dialect/where-sql-builder.ts
+@@ -25,6 +25,81 @@ import type { FormatWhereOptions } from './query-generator-typescript.js';
+ import type { AbstractQueryGenerator } from './query-generator.js';
+ import type { WhereAttributeHashValue } from './where-sql-builder-types.js';
+ 
++export interface ParsedJsonPathColumn {
++  readonly columnName: string;
++  readonly pathSegments: ReadonlyArray<string | number>;
++}
++
++export function parseJsonPathString(input: string): ParsedJsonPathColumn | null {
++  if (!input || typeof input !== 'string') {
++    return null;
++  }
++
++  const hasBracketNotation = /\[\d+\]/.test(input);
++  if (!hasBracketNotation) {
++    return null;
++  }
++
++  const pathSegments: Array<string | number> = [];
++  let columnName = '';
++  let currentToken = '';
++  let i = 0;
++
++  while (i < input.length) {
++    const char = input[i];
++
++    if (char === '[') {
++      if (columnName === '' && currentToken !== '') {
++        columnName = currentToken;
++        currentToken = '';
++      } else if (currentToken !== '') {
++        pathSegments.push(currentToken);
++        currentToken = '';
++      }
++
++      const closeBracket = input.indexOf(']', i);
++      if (closeBracket === -1) {
++        return null;
++      }
++
++      const indexStr = input.slice(i + 1, closeBracket);
++      const index = Number(indexStr);
++      if (!Number.isInteger(index) || index < 0) {
++        return null;
++      }
++
++      pathSegments.push(index);
++      i = closeBracket + 1;
++    } else if (char === '.') {
++      if (columnName === '' && currentToken !== '') {
++        columnName = currentToken;
++      } else if (currentToken !== '') {
++        pathSegments.push(currentToken);
++      }
++
++      currentToken = '';
++      i++;
++    } else {
++      currentToken += char;
++      i++;
++    }
++  }
++
++  if (currentToken !== '') {
++    if (columnName === '') {
++      columnName = currentToken;
++    } else {
++      pathSegments.push(currentToken);
++    }
++  }
++
++  if (pathSegments.length === 0) {
++    return null;
++  }
++
++  return { columnName, pathSegments };
++}
++
+ export class PojoWhere {
+   declare leftOperand: Expression;
+   declare whereValue: WhereAttributeHashValue<any>;
+diff --git a/packages/core/src/expression-builders/col.ts b/packages/core/src/expression-builders/col.ts
+index 42400f36f..879866bcf 100644
+--- a/packages/core/src/expression-builders/col.ts
++++ b/packages/core/src/expression-builders/col.ts
+@@ -1,31 +1,116 @@
+ import { BaseSqlExpression, SQL_IDENTIFIER } from './base-sql-expression.js';
+ 
+-/**
+- * Do not use me directly. Use {@link sql.col}
+- */
+ export class Col extends BaseSqlExpression {
+   declare protected readonly [SQL_IDENTIFIER]: 'col';
+ 
+   readonly identifiers: string[];
+ 
+-  constructor(...identifiers: string[]) {
++  readonly jsonPath: ReadonlyArray<string | number> | null;
++
++  constructor(identifiers: string | readonly string[], jsonPath?: ReadonlyArray<string | number>) {
+     super();
+ 
+-    // TODO: verify whether the "more than one identifier" case is still needed
+-    this.identifiers = identifiers;
++    if (Array.isArray(identifiers)) {
++      this.identifiers = [...identifiers];
++    } else {
++      this.identifiers = [identifiers];
++    }
++
++    if (jsonPath && jsonPath.length > 0) {
++      this.jsonPath = jsonPath;
++    } else if (
++      this.identifiers.length === 1 &&
++      typeof this.identifiers[0] === 'string'
++    ) {
++      const parsed = detectJsonPathFromString(this.identifiers[0]);
++      if (parsed) {
++        this.identifiers = [parsed.columnName];
++        this.jsonPath = parsed.pathSegments;
++      } else {
++        this.jsonPath = null;
++      }
++    } else {
++      this.jsonPath = null;
++    }
++  }
++}
++
++function detectJsonPathFromString(
++  input: string,
++): { columnName: string; pathSegments: ReadonlyArray<string | number> } | null {
++  if (!input || typeof input !== 'string') {
++    return null;
++  }
++
++  const hasBracketNotation = /\[\d+\]/.test(input);
++  if (!hasBracketNotation) {
++    return null;
++  }
++
++  const pathSegments: Array<string | number> = [];
++  let columnName = '';
++  let currentToken = '';
++  let i = 0;
++
++  while (i < input.length) {
++    const char = input[i];
++
++    if (char === '[') {
++      if (columnName === '' && currentToken !== '') {
++        columnName = currentToken;
++        currentToken = '';
++      } else if (currentToken !== '') {
++        pathSegments.push(currentToken);
++        currentToken = '';
++      }
++
++      const closeBracket = input.indexOf(']', i);
++      if (closeBracket === -1) {
++        return null;
++      }
++
++      const indexStr = input.slice(i + 1, closeBracket);
++      const index = Number(indexStr);
++      if (!Number.isInteger(index) || index < 0) {
++        return null;
++      }
++
++      pathSegments.push(index);
++      i = closeBracket + 1;
++    } else if (char === '.') {
++      if (columnName === '' && currentToken !== '') {
++        columnName = currentToken;
++      } else if (currentToken !== '') {
++        pathSegments.push(currentToken);
++      }
++
++      currentToken = '';
++      i++;
++    } else {
++      currentToken += char;
++      i++;
++    }
++  }
++
++  if (currentToken !== '') {
++    if (columnName === '') {
++      columnName = currentToken;
++    } else {
++      pathSegments.push(currentToken);
++    }
+   }
++
++  if (pathSegments.length === 0) {
++    return null;
++  }
++
++  return { columnName, pathSegments };
+ }
+ 
+-/**
+- * Creates an object which represents a column in the DB, this allows referencing another column in your query.
+- * This is often useful in conjunction with {@link sql.fn}, {@link sql.where} and {@link sql} which interpret strings as values and not column names.
+- *
+- * Col works similarly to {@link sql.identifier}, but "*" has special meaning, for backwards compatibility.
+- *
+- * ⚠️ We recommend using {@link sql.identifier}, or {@link sql.attribute} instead.
+- *
+- * @param identifiers The name of the column
+- */
+ export function col(...identifiers: string[]): Col {
+-  return new Col(...identifiers);
++  if (identifiers.length === 1) {
++    return new Col(identifiers[0]);
++  }
++
++  return new Col(identifiers);
+ }

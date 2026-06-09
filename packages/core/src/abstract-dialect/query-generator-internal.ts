@@ -330,15 +330,25 @@ Only named replacements (:name) are allowed in literal() because we cannot guara
   }
 
   formatCol(piece: Col, options?: EscapeOptions) {
-    // TODO: can this be removed?
     if (piece.identifiers.length === 1 && piece.identifiers[0].startsWith('*')) {
       return '*';
     }
 
-    // Weird legacy behavior
+    if (piece.jsonPath && piece.jsonPath.length > 0) {
+      let quotedColumn: string;
+      if (piece.identifiers.length === 1) {
+        quotedColumn = this.queryGenerator.quoteIdentifier(piece.identifiers[0]);
+      } else {
+        const table = piece.identifiers.slice(0, -1).join('->');
+        const column = piece.identifiers.at(-1)!;
+        quotedColumn = `${this.queryGenerator.quoteIdentifier(table)}.${this.queryGenerator.quoteIdentifier(column)}`;
+      }
+
+      return this.queryGenerator.jsonPathExtractionQuery(quotedColumn, piece.jsonPath, false);
+    }
+
     const identifiers = piece.identifiers.length === 1 ? piece.identifiers[0] : piece.identifiers;
 
-    // TODO: use quoteIdentifiers?
     // @ts-expect-error -- quote is declared on child class
     return this.queryGenerator.quote(identifiers, options?.model, undefined, options);
   }

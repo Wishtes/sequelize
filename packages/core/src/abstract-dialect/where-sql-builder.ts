@@ -25,6 +25,81 @@ import type { FormatWhereOptions } from './query-generator-typescript.js';
 import type { AbstractQueryGenerator } from './query-generator.js';
 import type { WhereAttributeHashValue } from './where-sql-builder-types.js';
 
+export interface ParsedJsonPathColumn {
+  readonly columnName: string;
+  readonly pathSegments: ReadonlyArray<string | number>;
+}
+
+export function parseJsonPathString(input: string): ParsedJsonPathColumn | null {
+  if (!input || typeof input !== 'string') {
+    return null;
+  }
+
+  const hasBracketNotation = /\[\d+\]/.test(input);
+  if (!hasBracketNotation) {
+    return null;
+  }
+
+  const pathSegments: Array<string | number> = [];
+  let columnName = '';
+  let currentToken = '';
+  let i = 0;
+
+  while (i < input.length) {
+    const char = input[i];
+
+    if (char === '[') {
+      if (columnName === '' && currentToken !== '') {
+        columnName = currentToken;
+        currentToken = '';
+      } else if (currentToken !== '') {
+        pathSegments.push(currentToken);
+        currentToken = '';
+      }
+
+      const closeBracket = input.indexOf(']', i);
+      if (closeBracket === -1) {
+        return null;
+      }
+
+      const indexStr = input.slice(i + 1, closeBracket);
+      const index = Number(indexStr);
+      if (!Number.isInteger(index) || index < 0) {
+        return null;
+      }
+
+      pathSegments.push(index);
+      i = closeBracket + 1;
+    } else if (char === '.') {
+      if (columnName === '' && currentToken !== '') {
+        columnName = currentToken;
+      } else if (currentToken !== '') {
+        pathSegments.push(currentToken);
+      }
+
+      currentToken = '';
+      i++;
+    } else {
+      currentToken += char;
+      i++;
+    }
+  }
+
+  if (currentToken !== '') {
+    if (columnName === '') {
+      columnName = currentToken;
+    } else {
+      pathSegments.push(currentToken);
+    }
+  }
+
+  if (pathSegments.length === 0) {
+    return null;
+  }
+
+  return { columnName, pathSegments };
+}
+
 export class PojoWhere {
   declare leftOperand: Expression;
   declare whereValue: WhereAttributeHashValue<any>;
