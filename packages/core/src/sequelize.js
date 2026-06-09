@@ -67,6 +67,82 @@ import { Validator } from './utils/validator-extras';
  * This is the main class, the entry point to sequelize.
  */
 export class Sequelize extends SequelizeTypeScript {
+  constructor(options) {
+    super(options);
+
+    const healthCheck = this.options.pool?.healthCheck;
+    if (healthCheck) {
+      const mode = healthCheck.mode;
+
+      if (mode === 'acquire' || mode === 'both') {
+        const originalAcquire = this.pool.acquire.bind(this.pool);
+        this.pool.acquire = async (acquireOptions) => {
+          let connection;
+          let isValid = false;
+          while (!isValid) {
+            connection = await originalAcquire(acquireOptions);
+            isValid = await this.dialect.connectionManager.healthCheck(connection);
+            if (!isValid) {
+              await this.pool.destroy(connection);
+            }
+          }
+          return connection;
+        };
+      }
+
+      if (mode === 'idle' || mode === 'both') {
+        const interval = healthCheck.interval || 30000;
+        this._healthCheckTimer = setInterval(async () => {
+          try {
+            const types = ['write'];
+            if (this.pool.read) types.push('read');
+
+            for (const type of types) {
+              const subPool = type === 'read' ? this.pool.read : this.pool.write;
+              const available = subPool.available;
+              if (available === 0) continue;
+
+              const connections = await Promise.all(
+                Array.from({ length: available }).map(() => this.pool.acquire({ type }))
+              );
+
+              await Promise.all(
+                connections.map(async connection => {
+                  try {
+                    const isValid = await this.dialect.connectionManager.healthCheck(connection);
+                    if (!isValid) {
+                      await this.pool.destroy(connection);
+                    } else {
+                      this.pool.release(connection);
+                    }
+                  } catch (e) {
+                    await this.pool.destroy(connection);
+                  }
+                })
+              );
+            }
+          } catch (e) {
+            // ignore errors during idle check
+          }
+        }, interval);
+        
+        if (this._healthCheckTimer.unref) {
+          this._healthCheckTimer.unref();
+        }
+      }
+    }
+  }
+
+  /**
+   * Close all connections used by this sequelize instance, and free all references so the instance can be garbage collected.
+   */
+  async close() {
+    if (this._healthCheckTimer) {
+      clearInterval(this._healthCheckTimer);
+    }
+    return super.close();
+  }
+
   /**
    * Returns the specified dialect.
    *

@@ -1,0 +1,150 @@
+diff --git a/packages/core/src/abstract-dialect/connection-manager.ts b/packages/core/src/abstract-dialect/connection-manager.ts
+index af50bd460..632ec2454 100644
+--- a/packages/core/src/abstract-dialect/connection-manager.ts
++++ b/packages/core/src/abstract-dialect/connection-manager.ts
+@@ -64,6 +64,30 @@ export class AbstractConnectionManager<
+     throw new Error(`validate not implemented in ${this.constructor.name}`);
+   }
+ 
++  /**
++   * Determine if a connection is healthy by executing a simple query
++   *
++   * @param connection
++   */
++  async healthCheck(connection: TConnection): Promise<boolean> {
++    try {
++      const dummyTableName = this.dialect.supports.select.dummyTable;
++      const fromClause = dummyTableName
++        ? ` FROM ${this.dialect.queryGenerator.quoteIdentifier(dummyTableName)}`
++        : '';
++
++      await this.sequelize.queryRaw(`SELECT 1+1 AS result${fromClause}`, {
++        connection,
++        raw: true,
++        plain: true,
++        type: 'SELECT',
++      });
++      return true;
++    } catch (error) {
++      return false;
++    }
++  }
++
+   async connect(_config: ConnectionOptions<Dialect>): Promise<TConnection> {
+     throw new Error(`connect not implemented in ${this.constructor.name}`);
+   }
+diff --git a/packages/core/src/sequelize.js b/packages/core/src/sequelize.js
+index 763ad7383..93a4bb66a 100644
+--- a/packages/core/src/sequelize.js
++++ b/packages/core/src/sequelize.js
+@@ -67,6 +67,82 @@ import { Validator } from './utils/validator-extras';
+  * This is the main class, the entry point to sequelize.
+  */
+ export class Sequelize extends SequelizeTypeScript {
++  constructor(options) {
++    super(options);
++
++    const healthCheck = this.options.pool?.healthCheck;
++    if (healthCheck) {
++      const mode = healthCheck.mode;
++
++      if (mode === 'acquire' || mode === 'both') {
++        const originalAcquire = this.pool.acquire.bind(this.pool);
++        this.pool.acquire = async (acquireOptions) => {
++          let connection;
++          let isValid = false;
++          while (!isValid) {
++            connection = await originalAcquire(acquireOptions);
++            isValid = await this.dialect.connectionManager.healthCheck(connection);
++            if (!isValid) {
++              await this.pool.destroy(connection);
++            }
++          }
++          return connection;
++        };
++      }
++
++      if (mode === 'idle' || mode === 'both') {
++        const interval = healthCheck.interval || 30000;
++        this._healthCheckTimer = setInterval(async () => {
++          try {
++            const types = ['write'];
++            if (this.pool.read) types.push('read');
++
++            for (const type of types) {
++              const subPool = type === 'read' ? this.pool.read : this.pool.write;
++              const available = subPool.available;
++              if (available === 0) continue;
++
++              const connections = await Promise.all(
++                Array.from({ length: available }).map(() => this.pool.acquire({ type }))
++              );
++
++              await Promise.all(
++                connections.map(async connection => {
++                  try {
++                    const isValid = await this.dialect.connectionManager.healthCheck(connection);
++                    if (!isValid) {
++                      await this.pool.destroy(connection);
++                    } else {
++                      this.pool.release(connection);
++                    }
++                  } catch (e) {
++                    await this.pool.destroy(connection);
++                  }
++                })
++              );
++            }
++          } catch (e) {
++            // ignore errors during idle check
++          }
++        }, interval);
++        
++        if (this._healthCheckTimer.unref) {
++          this._healthCheckTimer.unref();
++        }
++      }
++    }
++  }
++
++  /**
++   * Close all connections used by this sequelize instance, and free all references so the instance can be garbage collected.
++   */
++  async close() {
++    if (this._healthCheckTimer) {
++      clearInterval(this._healthCheckTimer);
++    }
++    return super.close();
++  }
++
+   /**
+    * Returns the specified dialect.
+    *
+diff --git a/packages/core/src/sequelize.types.ts b/packages/core/src/sequelize.types.ts
+index d136b0120..13d56987d 100644
+--- a/packages/core/src/sequelize.types.ts
++++ b/packages/core/src/sequelize.types.ts
+@@ -25,6 +25,23 @@ export interface PoolOptions<Dialect extends AbstractDialect>
+    * If provided, this overrides the default connection validation built in to sequelize.
+    */
+   validate?: ((connection?: Connection<Dialect>) => boolean) | undefined;
++
++  /**
++   * Health check configuration for the connection pool.
++   */
++  healthCheck?: {
++    /**
++     * Mode of the health check:
++     * - 'idle': Periodically checks idle connections in the pool.
++     * - 'acquire': Checks the connection before returning it from `pool.acquire()`.
++     * - 'both': Enables both 'idle' and 'acquire' modes.
++     */
++    mode?: 'idle' | 'acquire' | 'both';
++    /**
++     * Interval in milliseconds for 'idle' mode. Defaults to 30000.
++     */
++    interval?: number;
++  } | undefined;
+ }
+ 
+ /**

@@ -64,6 +64,30 @@ export class AbstractConnectionManager<
     throw new Error(`validate not implemented in ${this.constructor.name}`);
   }
 
+  /**
+   * Determine if a connection is healthy by executing a simple query
+   *
+   * @param connection
+   */
+  async healthCheck(connection: TConnection): Promise<boolean> {
+    try {
+      const dummyTableName = this.dialect.supports.select.dummyTable;
+      const fromClause = dummyTableName
+        ? ` FROM ${this.dialect.queryGenerator.quoteIdentifier(dummyTableName)}`
+        : '';
+
+      await this.sequelize.queryRaw(`SELECT 1+1 AS result${fromClause}`, {
+        connection,
+        raw: true,
+        plain: true,
+        type: 'SELECT',
+      });
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
   async connect(_config: ConnectionOptions<Dialect>): Promise<TConnection> {
     throw new Error(`connect not implemented in ${this.constructor.name}`);
   }
